@@ -1,293 +1,353 @@
 import re
 from io import BytesIO
 from datetime import datetime
-from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+from openpyxl.utils import get_column_letter
 
 st.set_page_config(page_title="Construction Progress Organizer", page_icon="🏗️", layout="wide")
 
+# These columns follow the user's sample progress-report layout.
 COLUMNS = [
-    "Date", "Tower / Location", "Today's Activities", "Tomorrow's Planned Activities",
-    "Manpower", "Machinery", "Materials", "Weather", "Working Hours", "Other Notes",
-    "Original Message"
+    "Date",
+    "Tower",
+    "Working hour",
+    "weather",
+    "rainfall (mm)",
+    "Main power",
+    "machinery",
+    "today's activity",
+    "plan/ tomorrow activity",
+    "Soil nail compacted",
+    "MACHINERIES/MATERIALS RECEIVED:",
+    "Checklists",
 ]
 
 DATE_PATTERNS = [
-    (re.compile(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b"), "%d/%m/%Y"),
-    (re.compile(r"\b(\d{4}-\d{1,2}-\d{1,2})\b"), "%Y-%m-%d"),
+    re.compile(r"\b\d{1,2}[-/](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\b", re.I),
+    re.compile(r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b"),
+    re.compile(r"\b\d{4}-\d{1,2}-\d{1,2}\b"),
 ]
+TOWER_RE = re.compile(r"\b(?:MO\s*[-/]?\s*\d+|KEM\s*[-/]?\s*[A-Z0-9]+|KWT\s*[-/]?\s*[A-Z0-9]+|[A-Z]{2,6}[- ]\d{2,4})\b", re.I)
 
-TOWER_RE = re.compile(
-    r"\b((?:MO|KEM|KWT|TOWER)[\s-]*[A-Z0-9]+(?:[\s/-]*[A-Z0-9]+)*)\b",
-    re.IGNORECASE
-)
-
-CATEGORY_KEYWORDS = {
-    "Manpower": ["manpower", "worker", "workers", "labour", "labor", "personnel", "staff"],
-    "Machinery": ["machinery", "machine", "excavator", "lorry", "truck", "crane", "roller", "backhoe"],
-    "Materials": ["material", "materials", "cement", "sand", "aggregate", "stone", "gabion", "geotextile", "steel", "concrete"],
-    "Weather": ["weather", "rain", "raining", "sunny", "cloudy"],
-    "Working Hours": ["working hours", "work hour", "started at", "finished at", "stop work", "resumed work"],
+# Labels are intentionally editable so they can be adjusted to the contractor's wording.
+FIELD_LABELS = {
+    "Working hour": ["working hour", "working hours", "work hour", "work hours", "working time"],
+    "weather": ["weather"],
+    "rainfall (mm)": ["rainfall", "rain fall", "precipitation"],
+    "Main power": ["main power", "manpower", "mainpower"],
+    "machinery": ["machinery", "machine", "equipment"],
+    "today's activity": ["today's activity", "todays activity", "today activity", "today's activities",
+                         "today activities", "actual activity", "activities carried out", "work done"],
+    "plan/ tomorrow activity": ["plan/ tomorrow activity", "plan tomorrow", "tomorrow activity",
+                                "tomorrow's activity", "tomorrow activities", "planned activity",
+                                "planned activities", "plan for tomorrow", "next day activity"],
+    "Soil nail compacted": ["soil nail compacted", "soil nail", "soil nailing", "compacted"],
+    "MACHINERIES/MATERIALS RECEIVED:": ["machineries/materials received", "machinery/materials received",
+                                       "materials received", "machinery received", "materials delivered"],
+    "Checklists": ["checklists", "checklist", "mp status", "mp"],
 }
 
-TOMORROW_MARKERS = [
-    "tomorrow", "plan for tomorrow", "planned for tomorrow", "next day",
-    "proposed activity", "planned activity", "will continue", "will proceed"
-]
-TODAY_MARKERS = ["today's activity", "today activity", "work done", "completed today", "actual activity"]
-
-
-def normalize_date(value):
-    value = value.strip()
-    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(value, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            pass
-    return value
-
-
-def extract_date(text):
-    for pattern, _ in DATE_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            return normalize_date(match.group(1))
+def find_date(text):
+    for pattern in DATE_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            return m.group(0)
     return ""
 
+def find_tower(text):
+    m = TOWER_RE.search(text)
+    return re.sub(r"\s+", "", m.group(0)).upper() if m else ""
 
-def extract_tower(text):
-    match = TOWER_RE.search(text)
-    if not match:
-        return ""
-    value = re.sub(r"\s+", " ", match.group(1)).strip(" -/")
-    return value.upper()
+def norm_label(text):
+    return re.sub(r"[\s:_\-]+", " ", text.strip().lower()).strip()
 
+# Build label matching from longest to shortest to avoid matching "machine"
+# before "machineries/materials received".
+LABEL_LOOKUP = []
+for field, labels in FIELD_LABELS.items():
+    for label in labels:
+        LABEL_LOOKUP.append((norm_label(label), field))
+LABEL_LOOKUP.sort(key=lambda x: len(x[0]), reverse=True)
 
-def classify_line(line):
-    lower = line.lower()
-    if any(marker in lower for marker in TOMORROW_MARKERS):
-        return "tomorrow"
-    if any(marker in lower for marker in TODAY_MARKERS):
-        return "today"
-    for field, words in CATEGORY_KEYWORDS.items():
-        if any(word in lower for word in words):
-            return field
-    return "today"
+def match_label(line):
+    cleaned = line.strip()
+    low = cleaned.lower()
+    for label, field in LABEL_LOOKUP:
+        # Accept "Label: value", "Label - value", and "Label value".
+        pattern = r"^\s*" + re.escape(label).replace(r"\ ", r"\s+") + r"\s*(?::|=|-)?\s*(.*)$"
+        m = re.match(pattern, low, re.I)
+        if m:
+            value = cleaned[len(cleaned) - len(m.group(1)):].strip() if m.group(1) else ""
+            return field, value
+    return None, ""
 
+def split_inline_label(line):
+    """Detect a field label appearing after other text on the same line."""
+    low = line.lower()
+    candidates = []
+    for label, field in LABEL_LOOKUP:
+        idx = low.find(label)
+        if idx > 0:
+            candidates.append((idx, label, field))
+    if not candidates:
+        return line, None, ""
+    idx, label, field = sorted(candidates, key=lambda x: x[0])[0]
+    before = line[:idx].strip(" ;,|-")
+    after = line[idx + len(label):].strip(" :-=;,")
+    return before, field, after
 
-def clean_line(line):
-    return re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+def empty_record(date="", tower=""):
+    return {c: "" for c in COLUMNS} | {"Date": date, "Tower": tower}
 
-
-def parse_messages(raw_text):
-    """Heuristic parser: keeps date/tower context and groups extracted lines."""
+def parse_message(message, source_number):
+    """Extract one or more date/tower records from a single pasted message."""
     records = []
-    current_date = ""
-    current_tower = ""
-    current = None
+    current_date = find_date(message)
+    current_tower = find_tower(message)
+    current = empty_record(current_date, current_tower)
+    current["_source"] = f"Message {source_number}"
+    current_field = "today's activity"
 
-    def new_record(date, tower):
-        return {
-            "Date": date,
-            "Tower / Location": tower,
-            "Today's Activities": [],
-            "Tomorrow's Planned Activities": [],
-            "Manpower": [],
-            "Machinery": [],
-            "Materials": [],
-            "Weather": [],
-            "Working Hours": [],
-            "Other Notes": [],
-            "Original Message": ""
-        }
-
-    def flush():
-        nonlocal current
-        if current is None:
+    def add_value(field, value):
+        value = value.strip(" \t:-|,;")
+        if not value:
             return
-        for key in COLUMNS[2:-1]:
-            current[key] = "; ".join(current[key])
-        records.append(current)
+        existing = current.get(field, "")
+        current[field] = (existing + "\n" + value).strip() if existing else value
+
+    def has_payload(row):
+        return any(str(row.get(c, "")).strip() for c in COLUMNS[2:])
+
+    def finish():
+        nonlocal current
+        if has_payload(current) or current["Date"] or current["Tower"]:
+            records.append({c: current.get(c, "") for c in COLUMNS} | {"Source Message": current.get("_source", "")})
         current = None
 
-    for original_line in raw_text.splitlines():
-        line = clean_line(original_line)
+    for raw in message.replace("•", "\n").splitlines():
+        line = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", raw).strip()
         if not line:
             continue
 
-        found_date = extract_date(line)
-        found_tower = extract_tower(line)
+        line_date = find_date(line)
+        line_tower = find_tower(line)
 
-        # A new date/tower header starts a new grouped record.
-        is_header = bool(found_date or found_tower)
-        if is_header:
-            if current is not None and (found_date or found_tower):
-                flush()
-            if found_date:
-                current_date = found_date
-            if found_tower:
-                current_tower = found_tower
-            # Remove date and tower labels from the remaining text.
-            content = line
-            if found_date:
-                content = content.replace(re.search(r"\b\d{1,4}[/-]\d{1,2}[/-]\d{2,4}\b|\b\d{4}-\d{1,2}-\d{1,2}\b", line).group(0), "")
-            if found_tower:
-                content = re.sub(re.escape(found_tower), "", content, flags=re.IGNORECASE)
-            content = content.strip(" :-|,")
-            if not content:
+        # A new date/tower header starts a new spreadsheet row when the current
+        # row already contains information.
+        if line_date or line_tower:
+            if has_payload(current):
+                finish()
+                current = empty_record(line_date or current_date, line_tower or current_tower)
+                current["_source"] = f"Message {source_number}"
+                current_field = "today's activity"
+            else:
+                if line_date:
+                    current["Date"] = line_date
+                if line_tower:
+                    current["Tower"] = line_tower
+
+            line = DATE_PATTERNS[0].sub("", line)
+            line = DATE_PATTERNS[1].sub("", line)
+            line = DATE_PATTERNS[2].sub("", line)
+            line = TOWER_RE.sub("", line).strip(" :-|,")
+            if not line:
                 continue
-            line = content
 
-        if current is None:
-            current = new_record(current_date, current_tower)
+        field, value = match_label(line)
+        if field:
+            current_field = field
+            if value:
+                add_value(field, value)
+            continue
 
-        if not current["Original Message"]:
-            current["Original Message"] = original_line.strip()
+        # Also handle messages where a label follows a sentence on the same line.
+        before, inline_field, after = split_inline_label(line)
+        if inline_field:
+            if before:
+                add_value(current_field, before)
+            current_field = inline_field
+            if after:
+                add_value(inline_field, after)
+            continue
+
+        # Recognise common unlabelled information without guessing too much.
+        lower = line.lower()
+        if re.search(r"\b\d+(?:\.\d+)?\s*mm\b", lower) and not current["rainfall (mm)"]:
+            add_value("rainfall (mm)", line)
+        elif any(x in lower for x in ["sunny", "cloudy", "rainy", "heavy rain", "light rain"]):
+            add_value("weather", line)
+        elif re.search(r"\b\d{3,4}\s*(?:hrs|hours)\b", lower) or ("am" in lower and "pm" in lower and any(ch.isdigit() for ch in lower)):
+            add_value("Working hour", line)
+        elif any(x in lower for x in ["excavator", "drilling machine", "concrete mixer", "grout mixer",
+                                      "lorry", "water pump", "air compressor", "compactor", "crane", "backhoe"]):
+            add_value("machinery", line)
+        elif any(x in lower for x in ["site engineer", "site supervisor", "operator", "general worker",
+                                      "technician", "pax", "manpower"]):
+            add_value("Main power", line)
+        elif any(x in lower for x in ["complete", "completed", "mp (", "checklist", "pending"]):
+            add_value("Checklists", line)
         else:
-            current["Original Message"] += "\n" + original_line.strip()
+            # Unlabelled progress statements default to today's activity.
+            add_value(current_field if current_field in ["today's activity", "plan/ tomorrow activity"] else "today's activity", line)
 
-        kind = classify_line(line)
-        if kind == "tomorrow":
-            current["Tomorrow's Planned Activities"].append(line)
-        elif kind == "today":
-            current["Today's Activities"].append(line)
-        elif kind in current:
-            current[kind].append(line)
-        else:
-            current["Other Notes"].append(line)
+    finish()
+    # Remove rows that contain no extracted content at all.
+    return [r for r in records if any(str(r.get(c, "")).strip() for c in COLUMNS)]
 
-    flush()
-    return pd.DataFrame(records, columns=COLUMNS)
+def parse_all(messages):
+    rows = []
+    for i, msg in enumerate(messages, start=1):
+        if msg.strip():
+            rows.extend(parse_message(msg, i))
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=COLUMNS + ["Source Message"])
+    return df[COLUMNS + ["Source Message"]]
 
+def make_formatted_excel(df):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Weekly Progress"
+    ws.append(COLUMNS)
 
-def make_excel(progress_df):
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        progress_df.to_excel(writer, index=False, sheet_name="Weekly Progress")
-        instructions = pd.DataFrame({
-            "Field": COLUMNS,
-            "Description": [
-                "Date of the reported work (YYYY-MM-DD where detected)",
-                "Tower or work location detected from the message",
-                "Work reported as completed / carried out",
-                "Activities stated as planned for the next day",
-                "Manpower or worker information",
-                "Machinery or equipment information",
-                "Materials mentioned",
-                "Weather or rainfall information",
-                "Working time information",
-                "Other information requiring review",
-                "Original text retained for checking"
-            ]
-        })
-        instructions.to_excel(writer, index=False, sheet_name="Column Guide")
-    output.seek(0)
-    return output.getvalue()
+    # Add one row per extracted date/tower record, in the same column order as
+    # the example supplied by the user.
+    for _, row in df.iterrows():
+        ws.append([row.get(col, "") for col in COLUMNS])
+
+    header_fill = PatternFill("solid", fgColor="8DB4E2")
+    header_font = Font(bold=True, color="000000", size=10)
+    thin = Side(style="thin", color="000000")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    widths = [13, 12, 19, 14, 15, 24, 23, 34, 34, 18, 27, 20]
+    for col_idx, width in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+    ws.row_dimensions[1].height = 34
+
+    for row_idx in range(2, ws.max_row + 1):
+        ws.row_dimensions[row_idx].height = 110
+        for cell in ws[row_idx]:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            cell.border = border
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    # Include source message mapping on a separate sheet for traceability.
+    source_ws = wb.create_sheet("Source Mapping")
+    source_ws.append(["Excel row", "Source message"])
+    for i, source in enumerate(df.get("Source Message", []), start=2):
+        source_ws.append([i, source])
+    for cell in source_ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.border = border
+    source_ws.column_dimensions["A"].width = 14
+    source_ws.column_dimensions["B"].width = 22
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 st.title("🏗️ Construction Progress Organizer")
 st.write(
-    "Paste contractor progress messages to organize information by date and tower, "
-    "review the extracted results, and export them to Excel."
+    "Paste each contractor update into a separate message box. The tool extracts the details "
+    "and prepares an Excel report using the same column layout as your sample."
 )
 st.info(
-    "This is a rule-based prototype. It does not understand every WhatsApp writing style. "
-    "Always check and correct the preview before exporting."
+    "The Excel columns follow your example: Date, Tower, Working hour, weather, rainfall, "
+    "Main power, machinery, today's activity, plan/tomorrow activity, Soil nail compacted, "
+    "Machineries/Materials received, and Checklists."
 )
 
-with st.expander("How to use"):
+with st.expander("How to use", expanded=True):
     st.markdown(
         """
-        1. Paste the contractor's message in the text box.
-        2. Select **Organize message**.
-        3. Check the extracted date, tower and information in the editable table.
-        4. Correct any mistakes manually.
-        5. Optionally upload an existing workbook to add the new rows.
-        6. Download the updated Excel file.
-
-        **Tip:** The parser works best when dates and tower names are written clearly, for example:
-        `17/11/2026 - Tower MO72` followed by bullet points.
+        1. Paste one contractor message into Message 1.
+        2. Click **+ Add another message** for each additional update.
+        3. Click **Organize messages**.
+        4. Review and correct the table. Automatic extraction can make mistakes.
+        5. Download the formatted Excel report.
         """
     )
 
-sample = """17/11/2026 - Tower MO72
-Today's activities:
-- Continue construction of gabion wall
-- Install geotextile at slope area
-Manpower: 6 workers
-Machinery: 1 excavator
-Weather: Cloudy
-Plan for tomorrow:
-- Continue gabion wall construction
+if "messages" not in st.session_state:
+    st.session_state.messages = [""]
 
-17/11/2026 - Tower MO89
-- Carry out drainage works
-- Deliver stone materials
-Working hours: 8.00 am - 5.00 pm
-"""
-with st.expander("View sample message"):
-    st.code(sample, language="text")
+def add_box():
+    st.session_state.messages.append("")
 
-raw_text = st.text_area(
-    "Paste contractor WhatsApp message here",
-    height=250,
-    placeholder="Paste the full progress message..."
-)
+def remove_box(i):
+    if len(st.session_state.messages) > 1:
+        st.session_state.messages.pop(i)
 
-if st.button("Organize message", type="primary", disabled=not raw_text.strip()):
-    parsed = parse_messages(raw_text)
-    if parsed.empty:
-        st.warning("No information was detected. Try pasting a message with a date, tower name or activity details.")
-    else:
-        st.session_state["parsed_progress"] = parsed
-        st.success(f"Organized {len(parsed)} record(s). Please review the table below.")
-
-if "parsed_progress" in st.session_state:
-    st.subheader("1. Review and edit extracted information")
-    edited = st.data_editor(
-        st.session_state["parsed_progress"],
-        num_rows="dynamic",
-        use_container_width=True,
-        key="progress_editor"
+st.subheader("1. Paste messages")
+for i in range(len(st.session_state.messages)):
+    st.markdown(f"**Message {i + 1}**")
+    st.session_state.messages[i] = st.text_area(
+        f"Paste message {i + 1}",
+        value=st.session_state.messages[i],
+        key=f"msg_{i}",
+        height=150,
+        placeholder="Paste one complete WhatsApp progress update here..."
     )
-    st.session_state["edited_progress"] = edited
+    if len(st.session_state.messages) > 1:
+        st.button(f"Remove Message {i + 1}", key=f"remove_{i}", on_click=remove_box, args=(i,))
 
-    st.subheader("2. Add to an existing Excel workbook (optional)")
-    uploaded = st.file_uploader("Upload an existing .xlsx progress workbook", type=["xlsx"])
-    existing_df = None
-    if uploaded is not None:
-        try:
-            existing_df = pd.read_excel(uploaded, sheet_name="Weekly Progress")
-            for column in COLUMNS:
-                if column not in existing_df.columns:
-                    existing_df[column] = ""
-            existing_df = existing_df[COLUMNS]
-            st.caption(f"Loaded {len(existing_df)} existing row(s) from the 'Weekly Progress' sheet.")
-        except Exception as exc:
-            st.error(
-                "The workbook could not be read. It must be an .xlsx file with a sheet named "
-                f"'Weekly Progress'. Details: {exc}"
-            )
+st.button("+ Add another message", on_click=add_box)
 
-    if st.button("Prepare Excel download", type="primary"):
-        final_df = edited.copy()
-        if existing_df is not None:
-            final_df = pd.concat([existing_df, final_df], ignore_index=True)
-        final_df = final_df.fillna("")
-        st.session_state["excel_bytes"] = make_excel(final_df)
-        st.session_state["export_rows"] = len(final_df)
-        st.success(f"Excel file prepared with {len(final_df)} total row(s).")
+if st.button("Organize messages", type="primary"):
+    result = parse_all(st.session_state.messages)
+    st.session_state.result_df = result
+    if result.empty:
+        st.warning("No usable details were detected. Please check the messages or fill in the missing details manually.")
+    else:
+        st.success(f"Created {len(result)} row(s). Review the extracted information below.")
 
-    if "excel_bytes" in st.session_state:
+if "result_df" in st.session_state and not st.session_state.result_df.empty:
+    st.subheader("2. Review and edit the Excel table")
+    st.caption("The table is editable. Correct any information that was placed in the wrong column.")
+    editable = st.data_editor(
+        st.session_state.result_df,
+        use_container_width=True,
+        num_rows="dynamic",
+        key="edit_report",
+        column_config={
+            "today's activity": st.column_config.TextColumn(width="large"),
+            "plan/ tomorrow activity": st.column_config.TextColumn(width="large"),
+            "Main power": st.column_config.TextColumn(width="large"),
+            "machinery": st.column_config.TextColumn(width="large"),
+            "MACHINERIES/MATERIALS RECEIVED:": st.column_config.TextColumn(width="large"),
+        }
+    )
+
+    st.subheader("3. Download formatted Excel")
+    st.write("The downloaded workbook uses the same column arrangement and a blue header similar to your sample.")
+    if st.button("Prepare Excel report", type="primary"):
+        st.session_state.xlsx_bytes = make_formatted_excel(editable.fillna(""))
+        st.success("Your Excel report is ready.")
+    if "xlsx_bytes" in st.session_state:
         st.download_button(
-            "⬇️ Download construction_progress.xlsx",
-            data=st.session_state["excel_bytes"],
-            file_name="construction_progress.xlsx",
+            "⬇️ Download weekly_progress_report.xlsx",
+            data=st.session_state.xlsx_bytes,
+            file_name="weekly_progress_report.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-        st.caption("The original message is included in the workbook so you can verify the extracted information.")
 
-st.divider()
-st.caption("Prototype for academic demonstration. Review all extracted data before using it in an official report.")
+st.caption(
+    "Prototype limitation: this version extracts information using labels and keywords. "
+    "Contractor messages may use different wording, so always verify the generated report."
+)
