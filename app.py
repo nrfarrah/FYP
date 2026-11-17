@@ -31,7 +31,7 @@ COLUMNS = [
 REF_YEAR = datetime.now().year  # used when a message has a date without a year
 
 # Tower code prefixes (editable in the sidebar). Tower = prefix + number, e.g. MO72, OF30.
-DEFAULT_TOWER_PREFIXES = "MO, OF"
+DEFAULT_TOWER_PREFIXES = ""  # blank = auto-detect any tower code
 
 # Fields that hold a numbered list inside one Excel cell, and the numbering style.
 LIST_FIELDS = {
@@ -130,15 +130,25 @@ def parse_date_cell(s):
 
 
 # ---------------------------------------------------------------- towers
+# Letter codes that look like a tower code but are not (SN1-5 = soil nail, MP = manpower ...).
+NOT_TOWER = {"SN", "MP", "EHV", "FDT", "RC", "KV", "MM", "CM", "NO", "KG", "MT", "LV", "HV", "TW", "TC", "ST"}
+
+
 def build_tower_re(prefixes):
+    """Blank prefixes = auto-detect any code like MO72, OF30, KT105 (2-3 capital letters + number).
+    With prefixes (e.g. "MO, OF") only those codes are accepted."""
     items = sorted({p.strip().upper() for p in prefixes.split(",") if p.strip()}, key=len, reverse=True)
-    items = [re.escape(p) for p in items] or ["MO"]
-    return re.compile(r"\b(?:" + "|".join(items) + r")\s?[-/]?\s?\d{1,4}[A-Z]?\b")
+    if items:
+        return re.compile(r"\b(?:" + "|".join(re.escape(p) for p in items) + r")\s?[-/]?\s?\d{1,4}[A-Z]?\b")
+    return re.compile(r"\b[A-Z]{2,3}-?\d{1,4}[A-Z]?\b")
 
 
 def find_tower(text, tower_re):
-    m = tower_re.search(text)
-    return re.sub(r"[\s\-/]+", "", m.group(0)) if m else ""
+    for m in tower_re.finditer(text):
+        code = re.sub(r"[\s\-/]+", "", m.group(0))
+        if re.match(r"[A-Z]+", code).group(0) not in NOT_TOWER:
+            return code
+    return ""
 
 
 # ---------------------------------------------------------------- labels
@@ -225,7 +235,23 @@ def parse_message(message, source_number, tower_re):
 
     # Default date/tower = first ones found anywhere in the message.
     first_dt = next((find_date(l)[0] for l in lines if find_date(l)[0]), None)
-    first_tower = next((find_tower(l, tower_re) for l in lines if find_tower(l, tower_re)), "")
+    def header_tower(l):
+        """Tower code from a header-like line only (a code inside a normal sentence, e.g.
+        'SN1-5 base', is not the tower)."""
+        t = find_tower(l, tower_re)
+        if not t:
+            return ""
+        rest = tower_re.sub(" ", WEEKDAY_RE.sub(" ", l))
+        if find_date(rest)[1]:
+            s, e = find_date(rest)[1]
+            rest = rest[:s] + " " + rest[e:]
+        rest = re.sub(r"\b(?:date|tower|location|site|day)\b", " ", rest, flags=re.I)
+        words = len(re.findall(r"[A-Za-z]+", rest))
+        title = any(p.search(l) for p in SKIP_PATTERNS)
+        return t if (words <= 1 or title) else ""
+
+    first_tower = next((header_tower(BULLET_RE.sub("", l).strip().strip("_")) for l in lines
+                        if header_tower(BULLET_RE.sub("", l).strip().strip("_"))), "")
 
     records = []
     state = {"date": fmt_date(first_dt) if first_dt else "", "tower": first_tower, "items": {}, "field": None}
@@ -426,8 +452,9 @@ st.write(
 with st.sidebar:
     st.header("Settings")
     tower_prefixes = st.text_input(
-        "Tower code prefixes", value=DEFAULT_TOWER_PREFIXES,
-        help="Comma separated. A tower is a prefix + number, e.g. MO72, OF30."
+        "Tower code prefixes (optional)", value=DEFAULT_TOWER_PREFIXES,
+        help="Leave blank to auto-detect any tower code (MO72, OF30, KT105 ...). "
+             "Or list prefixes, comma separated, e.g. MO, OF, KT, to accept only those."
     )
     fill_gaps = st.checkbox(
         "Add empty rows for missing days", value=True,
