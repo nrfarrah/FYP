@@ -25,6 +25,7 @@ COLUMNS = [
     "Soil nail compacted",
     "MACHINERIES/MATERIALS RECEIVED:",
     "Checklists",
+    "Remarks",
 ]
 
 REF_YEAR = datetime.now().year  # used when a message has a date without a year
@@ -39,6 +40,8 @@ LIST_FIELDS = {
     "today's activity": ")",                    # 1) Slope clearing ...
     "plan/ tomorrow activity": ")",
     "MACHINERIES/MATERIALS RECEIVED:": ")",
+    "Soil nail compacted": ")",
+    "Remarks": ")",
 }
 
 # Labels are intentionally editable so they can be adjusted to the contractor's wording.
@@ -53,11 +56,18 @@ FIELD_LABELS = {
     "plan/ tomorrow activity": ["plan/ tomorrow activity", "plan tomorrow", "tomorrow activity",
                                 "tomorrow's activity", "tomorrow activities", "planned activity",
                                 "planned activities", "plan for tomorrow", "next day activity",
-                                "plan activity", "tomorrow plan", "plan"],
-    "Soil nail compacted": ["soil nail compacted", "soil nails compacted"],
+                                "plan activity", "tomorrow plan", "plan tomorrow activity",
+                                "plan tomorrow activities", "plan for tomorrow activity",
+                                "tomorrow plan activity", "plan"],
+    "Soil nail compacted": ["soil nail compacted", "soil nails compacted", "soil nail completed",
+                            "soil nails completed", "soil nail complete", "soil nailing completed",
+                            "soil nail progress", "soil nail"],
     "MACHINERIES/MATERIALS RECEIVED:": ["machineries/materials received", "machinery/materials received",
-                                       "materials received", "machinery received", "materials delivered"],
+                                       "machineries materials received", "machinery materials received",
+                                       "material received", "materials received", "machinery received",
+                                       "machineries received", "materials delivered", "material delivered"],
     "Checklists": ["checklists", "checklist", "mp status"],
+    "Remarks": ["remarks", "remark", "notes", "note"],
 }
 
 # Lines containing these are report titles, not data. Add your own project title words here.
@@ -133,10 +143,11 @@ def find_tower(text, tower_re):
 
 # ---------------------------------------------------------------- labels
 def _label_regex(label):
-    body = r"[\s_]+".join(re.escape(w) for w in label.split())
+    # words may be separated by spaces, "_" or "/" (so "PLAN/TOMORROW ACTIVITY" works too)
+    body = r"[\s_/]+".join(re.escape(w) for w in re.split(r"[\s/]+", label) if w)
     # label must be followed by ":" / "=" / " - " / end of line, so words inside
     # normal sentences (e.g. "compressive", "Air Compressor") are never mistaken for labels.
-    return re.compile(r"^\s*" + body + r"\s*(?:\(mm\))?\s*(?:[:=]|[-–]\s|$)\s*(.*)$", re.I)
+    return re.compile(r"^\s*" + body + r"\s*(?:\(mm\))?\s*(?:[:=]+|[-–]\s+|[.\s]*$)\s*(.*)$", re.I)
 
 
 LABEL_LOOKUP = sorted(
@@ -233,8 +244,15 @@ def parse_message(message, source_number, tower_re):
         if value:
             state["items"].setdefault(field, []).append(value)
 
-    for raw in lines:
-        line = BULLET_RE.sub("", raw).strip()
+    def clean(raw):
+        return BULLET_RE.sub("", raw).strip().strip("_").strip()
+
+    # Index of the first real section heading. Free text before it (e.g. the project
+    # title) is not data, so it is dropped.
+    first_label_idx = next((i for i, l in enumerate(lines) if clean(l) and match_label(clean(l))[0]), None)
+
+    for idx, raw in enumerate(lines):
+        line = clean(raw)
         if not line:
             continue
 
@@ -265,6 +283,10 @@ def parse_message(message, source_number, tower_re):
             continue
 
         if skip_title or NOISE_LINE_RE.match(line):
+            continue
+
+        # Free text before the first heading = project title -> ignore it.
+        if first_label_idx is not None and idx < first_label_idx and not guess_field(line):
             continue
 
         field, value = match_label(line)
@@ -340,7 +362,7 @@ def make_formatted_excel(df, fill_gaps=True):
     body_font = Font(size=10)
     thin = Side(style="thin", color="000000")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    widths = [11, 10, 15, 11, 13, 26, 24, 38, 34, 14, 20, 18]
+    widths = [11, 10, 15, 11, 13, 26, 24, 38, 34, 24, 24, 18, 20]
 
     for col_idx, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(col_idx)].width = width
