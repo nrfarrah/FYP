@@ -151,6 +151,23 @@ def find_tower(text, tower_re):
     return ""
 
 
+# "TOWER KEM-KWT 127", "Tower: MO72, ..." -> the name written after the word TOWER.
+TOWER_PHRASE_RE = re.compile(r"\btower\b\s*[:\-–]?\s*([A-Za-z0-9][A-Za-z0-9\-/]*(?:[ ]+\d{1,4}[A-Za-z]?)?)", re.I)
+
+
+def extract_tower(line, tower_re):
+    """Return (tower name, line without the tower). Tower is "" when none is found."""
+    for m in TOWER_PHRASE_RE.finditer(line):
+        name = m.group(1).strip()
+        # needs a letter, plus a digit or ALL-CAPS ("TOWER 127" and "tower base" are not names)
+        if re.search(r"[A-Za-z]", name) and (re.search(r"\d", name) or name.isupper()):
+            return re.sub(r"\s+", " ", name).upper(), line[:m.start()] + " " + line[m.end():]
+    code = find_tower(line, tower_re)
+    if code:
+        return code, tower_re.sub(" ", line)
+    return "", line
+
+
 # ---------------------------------------------------------------- labels
 def _label_regex(label):
     # words may be separated by spaces, "_" or "/" (so "PLAN/TOMORROW ACTIVITY" works too)
@@ -238,10 +255,10 @@ def parse_message(message, source_number, tower_re):
     def header_tower(l):
         """Tower code from a header-like line only (a code inside a normal sentence, e.g.
         'SN1-5 base', is not the tower)."""
-        t = find_tower(l, tower_re)
+        t, rest = extract_tower(l, tower_re)
         if not t:
             return ""
-        rest = tower_re.sub(" ", WEEKDAY_RE.sub(" ", l))
+        rest = WEEKDAY_RE.sub(" ", rest)
         if find_date(rest)[1]:
             s, e = find_date(rest)[1]
             rest = rest[:s] + " " + rest[e:]
@@ -282,14 +299,13 @@ def parse_message(message, source_number, tower_re):
         if not line:
             continue
 
-        tower = find_tower(line, tower_re)
         dt, span = find_date(line)
 
         # What is left of the line once date / tower / weekday words are removed?
         core = line
         if span:
             core = core[:span[0]] + " " + core[span[1]:]
-        core = tower_re.sub(" ", core)
+        tower, core = extract_tower(core, tower_re)
         core = WEEKDAY_RE.sub(" ", core)
         core = re.sub(r"\b(?:date|tower|location|site|day)\b", " ", core, flags=re.I)
         core = core.strip(" :-–|,;&()._\t")
