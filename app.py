@@ -31,7 +31,6 @@ COLUMNS = [
 REF_YEAR = datetime.now().year  # used when a message has a date without a year
 
 # Tower code prefixes (editable in the sidebar). Tower = prefix + number, e.g. MO72, OF30.
-DEFAULT_TOWER_PREFIXES = ""  # blank = auto-detect any tower code
 
 # Fields that hold a numbered list inside one Excel cell, and the numbering style.
 LIST_FIELDS = {
@@ -130,42 +129,41 @@ def parse_date_cell(s):
 
 
 # ---------------------------------------------------------------- towers
-# Letter codes that look like a tower code but are not (SN1-5 = soil nail, MP = manpower ...).
-NOT_TOWER = {"SN", "MP", "EHV", "FDT", "RC", "KV", "MM", "CM", "NO", "KG", "MT", "LV", "HV", "TW", "TC", "ST"}
+def parse_tower_names(text):
+    """Tower names typed by the user: one per line, or separated by commas."""
+    names = []
+    for part in re.split(r"[\n,;]+", text or ""):
+        part = part.strip()
+        if part and part.lower() not in [n.lower() for n in names]:
+            names.append(part)
+    return names
 
 
-def build_tower_re(prefixes):
-    """Blank prefixes = auto-detect any code like MO72, OF30, KT105 (2-3 capital letters + number).
-    With prefixes (e.g. "MO, OF") only those codes are accepted."""
-    items = sorted({p.strip().upper() for p in prefixes.split(",") if p.strip()}, key=len, reverse=True)
-    if items:
-        return re.compile(r"\b(?:" + "|".join(re.escape(p) for p in items) + r")\s?[-/]?\s?\d{1,4}[A-Z]?\b")
-    return re.compile(r"\b[A-Z]{2,3}-?\d{1,4}[A-Z]?\b")
+def build_towers(names):
+    """[(name, regex)]. Each regex tolerates different spacing / hyphens,
+    e.g. "KEM-KWT 127" also matches "KEM KWT127" and "kem-kwt-127"."""
+    out = []
+    for name in names:
+        tokens = re.findall(r"[A-Za-z]+|\d+", name)
+        if tokens:
+            body = r"[\s\-_/.]*".join(re.escape(t) for t in tokens)
+            out.append((name, re.compile(r"(?<![A-Za-z0-9])" + body + r"(?![A-Za-z0-9])", re.I)))
+    return out
 
 
-def find_tower(text, tower_re):
-    for m in tower_re.finditer(text):
-        code = re.sub(r"[\s\-/]+", "", m.group(0))
-        if re.match(r"[A-Z]+", code).group(0) not in NOT_TOWER:
-            return code
-    return ""
-
-
-# "TOWER KEM-KWT 127", "Tower: MO72, ..." -> the name written after the word TOWER.
-TOWER_PHRASE_RE = re.compile(r"\btower\b\s*[:\-–]?\s*([A-Za-z0-9][A-Za-z0-9\-/]*(?:[ ]+\d{1,4}[A-Za-z]?)?)", re.I)
-
-
-def extract_tower(line, tower_re):
-    """Return (tower name, line without the tower). Tower is "" when none is found."""
-    for m in TOWER_PHRASE_RE.finditer(line):
-        name = m.group(1).strip()
-        # needs a letter, plus a digit or ALL-CAPS ("TOWER 127" and "tower base" are not names)
-        if re.search(r"[A-Za-z]", name) and (re.search(r"\d", name) or name.isupper()):
-            return re.sub(r"\s+", " ", name).upper(), line[:m.start()] + " " + line[m.end():]
-    code = find_tower(line, tower_re)
-    if code:
-        return code, tower_re.sub(" ", line)
-    return "", line
+def extract_tower(line, towers):
+    """Find one of the user's tower names in the line.
+    Returns (tower name as typed by the user, line without it). Tower is "" if none matches."""
+    best = None
+    for name, rx in towers:
+        m = rx.search(line)
+        if m and (best is None or (m.start(), -(m.end() - m.start())) < (best[1].start(), -(best[1].end() - best[1].start()))):
+            best = (name, m)
+    if not best:
+        return "", line
+    name, m = best
+    before = re.sub(r"\btowers?\s*[:\-–]?\s*$", " ", line[:m.start()], flags=re.I)
+    return name, before + " " + line[m.end():]
 
 
 # ---------------------------------------------------------------- labels
@@ -244,31 +242,41 @@ def build_row(items, date, tower, source):
     return row
 
 
-def parse_message(message, source_number, tower_re):
+def parse_message(message, source_number, towers):
     """Extract one or more date/tower records from a single pasted message."""
     message = (message.replace("\u200e", "").replace("’", "'").replace("‘", "'")
                .replace("*", "").replace("~", "").replace("•", "\n"))
     lines = message.splitlines()
 
-    # Default date/tower = first ones found anywhere in the message.
-    first_dt = next((find_date(l)[0] for l in lines if find_date(l)[0]), None)
-    def header_tower(l):
-        """Tower code from a header-like line only (a code inside a normal sentence, e.g.
-        'SN1-5 base', is not the tower)."""
-        t, rest = extract_tower(l, tower_re)
-        if not t:
-            return ""
-        rest = WEEKDAY_RE.sub(" ", rest)
-        if find_date(rest)[1]:
-            s, e = find_date(rest)[1]
-            rest = rest[:s] + " " + rest[e:]
-        rest = re.sub(r"\b(?:date|tower|location|site|day)\b", " ", rest, flags=re.I)
-        words = len(re.findall(r"[A-Za-z]+", rest))
-        title = any(p.search(l) for p in SKIP_PATTERNS)
-        return t if (words <= 1 or title) else ""
+    def clean(raw):
+        return BULLET_RE.sub("", raw).strip().strip("_").strip()
 
-    first_tower = next((header_tower(BULLET_RE.sub("", l).strip().strip("_")) for l in lines
-                        if header_tower(BULLET_RE.sub("", l).strip().strip("_"))), "")
+    # Index of the first real section heading. Free text before it (project title,
+    # "DAILY PROGRESS REPORT - TOWER ...") is the title area, not data.
+    first_label_idx = next((i for i, l in enumerate(lines) if clean(l) and match_label(clean(l))[0]), None)
+
+    def is_header(idx, line, rest):
+        """Is this a header line (tower / date / title) rather than normal content?"""
+        r = WEEKDAY_RE.sub(" ", rest)
+        d = find_date(r)[1]
+        if d:
+            r = r[:d[0]] + " " + r[d[1]:]
+        r = re.sub(r"\b(?:date|tower|location|site|day)\b", " ", r, flags=re.I)
+        words = len(re.findall(r"[A-Za-z]+", r))
+        in_title_area = first_label_idx is not None and idx < first_label_idx
+        return words <= 1 or in_title_area or any(p.search(line) for p in SKIP_PATTERNS)
+
+    # Default date / tower = first ones found in a header line.
+    first_dt = next((find_date(l)[0] for l in lines if find_date(l)[0]), None)
+    first_tower = ""
+    for idx, raw in enumerate(lines):
+        line = clean(raw)
+        t, rest = extract_tower(line, towers) if line else ("", line)
+        if t and is_header(idx, line, rest):
+            first_tower = t
+            break
+    if not first_tower and len(towers) == 1:
+        first_tower = towers[0][0]          # only one tower entered -> it must be this one
 
     records = []
     state = {"date": fmt_date(first_dt) if first_dt else "", "tower": first_tower, "items": {}, "field": None}
@@ -287,13 +295,6 @@ def parse_message(message, source_number, tower_re):
         if value:
             state["items"].setdefault(field, []).append(value)
 
-    def clean(raw):
-        return BULLET_RE.sub("", raw).strip().strip("_").strip()
-
-    # Index of the first real section heading. Free text before it (e.g. the project
-    # title) is not data, so it is dropped.
-    first_label_idx = next((i for i, l in enumerate(lines) if clean(l) and match_label(clean(l))[0]), None)
-
     for idx, raw in enumerate(lines):
         line = clean(raw)
         if not line:
@@ -305,16 +306,19 @@ def parse_message(message, source_number, tower_re):
         core = line
         if span:
             core = core[:span[0]] + " " + core[span[1]:]
-        tower, core = extract_tower(core, tower_re)
+        tower, core = extract_tower(core, towers)
+        if tower and not is_header(idx, line, core):
+            tower = ""                       # tower name inside a normal sentence -> not a header
         core = WEEKDAY_RE.sub(" ", core)
         core = re.sub(r"\b(?:date|tower|location|site|day)\b", " ", core, flags=re.I)
         core = core.strip(" :-–|,;&()._\t")
         n_words = len(re.findall(r"[A-Za-z]+", core))
 
         skip_title = any(p.search(line) for p in SKIP_PATTERNS)
+        in_title_area = first_label_idx is not None and idx < first_label_idx
 
         # Pure header line (date and/or tower, plus maybe a report title) -> may start a new row.
-        if (tower or dt) and (n_words <= 1 or skip_title):
+        if (tower or dt) and (n_words <= 1 or skip_title or in_title_area):
             new_date = fmt_date(dt) if dt else ""
             if has_payload() and ((new_date and new_date != state["date"]) or (tower and tower != state["tower"])):
                 flush()
@@ -328,7 +332,7 @@ def parse_message(message, source_number, tower_re):
             continue
 
         # Free text before the first heading = project title -> ignore it.
-        if first_label_idx is not None and idx < first_label_idx and not guess_field(line):
+        if in_title_area and not guess_field(line):
             continue
 
         field, value = match_label(line)
@@ -346,11 +350,11 @@ def parse_message(message, source_number, tower_re):
     return records
 
 
-def parse_all(messages, tower_re):
+def parse_all(messages, towers):
     rows = []
     for i, msg in enumerate(messages, start=1):
         if msg.strip():
-            rows.extend(parse_message(msg, i, tower_re))
+            rows.extend(parse_message(msg, i, towers))
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=COLUMNS + ["Source Message"])
@@ -362,7 +366,7 @@ def natural_key(s):
     return (s == "", [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s)])
 
 
-def build_layout(df, fill_gaps):
+def build_layout(df, fill_gaps, tower_order=()):
     """Group rows by tower (sorted by date). Optionally add empty rows for missing days."""
     recs = []
     for r in df.fillna("").to_dict("records"):
@@ -372,7 +376,9 @@ def build_layout(df, fill_gaps):
     start, end = (min(dates), max(dates)) if dates else (None, None)
 
     blocks = []
-    for tower in sorted({str(r.get("Tower", "")) for r in recs}, key=natural_key):
+    order = list(tower_order)
+    tower_key = lambda t: (order.index(t) if t in order else len(order), natural_key(t))
+    for tower in sorted({str(r.get("Tower", "")) for r in recs}, key=tower_key):
         mine = [r for r in recs if str(r.get("Tower", "")) == tower]
         if fill_gaps and tower and start:
             have = {r["_d"] for r in mine if r["_d"]}
@@ -392,7 +398,7 @@ def est_lines(text, width):
     return sum(max(1, ceil(len(part) / chars)) for part in str(text).split("\n"))
 
 
-def make_formatted_excel(df, fill_gaps=True):
+def make_formatted_excel(df, fill_gaps=True, tower_order=()):
     wb = Workbook()
     ws = wb.active
     ws.title = "Weekly Progress"
@@ -417,7 +423,7 @@ def make_formatted_excel(df, fill_gaps=True):
 
     row_no = 1
     source_map = []
-    for b_idx, block in enumerate(build_layout(df, fill_gaps)):
+    for b_idx, block in enumerate(build_layout(df, fill_gaps, tower_order)):
         if b_idx > 0:  # coloured separator row between towers, like the sample
             row_no += 1
             ws.append([""] * len(COLUMNS))
@@ -467,11 +473,6 @@ st.write(
 
 with st.sidebar:
     st.header("Settings")
-    tower_prefixes = st.text_input(
-        "Tower code prefixes (optional)", value=DEFAULT_TOWER_PREFIXES,
-        help="Leave blank to auto-detect any tower code (MO72, OF30, KT105 ...). "
-             "Or list prefixes, comma separated, e.g. MO, OF, KT, to accept only those."
-    )
     fill_gaps = st.checkbox(
         "Add empty rows for missing days", value=True,
         help="Fills every tower with all dates from the earliest to the latest date, like your sample."
@@ -480,11 +481,12 @@ with st.sidebar:
 with st.expander("How to use", expanded=True):
     st.markdown(
         """
-        1. Paste one contractor message into Message 1.
-        2. Click **+ Add another message** for each additional update.
-        3. Click **Organize messages**.
-        4. Review and correct the table. Automatic extraction can make mistakes.
-        5. Download the formatted Excel report.
+        1. Type the tower names first (one per line).
+        2. Paste one contractor message into Message 1.
+        3. Click **+ Add another message** for each additional update.
+        4. Click **Organize messages**.
+        5. Review and correct the table. Automatic extraction can make mistakes.
+        6. Download the formatted Excel report.
         """
     )
 
@@ -501,7 +503,22 @@ def remove_box(i):
         st.session_state.messages.pop(i)
 
 
-st.subheader("1. Paste messages")
+st.subheader("1. Enter the tower names")
+tower_text = st.text_area(
+    "Tower names (one per line, or separated by commas)",
+    key="tower_names",
+    height=110,
+    placeholder="MO72\nMO89\nKEM-KWT 127\nOF30",
+    help="Type each tower exactly the way you want it to appear in the Tower column. "
+         "The app looks for these names in every message.",
+)
+tower_names = parse_tower_names(tower_text)
+if tower_names:
+    st.caption("Towers: " + "  |  ".join(tower_names))
+else:
+    st.warning("Enter at least one tower name above so the app knows which tower each message is for.")
+
+st.subheader("2. Paste messages")
 for i in range(len(st.session_state.messages)):
     st.markdown(f"**Message {i + 1}**")
     st.session_state.messages[i] = st.text_area(
@@ -517,7 +534,7 @@ for i in range(len(st.session_state.messages)):
 st.button("+ Add another message", on_click=add_box)
 
 if st.button("Organize messages", type="primary"):
-    result = parse_all(st.session_state.messages, build_tower_re(tower_prefixes))
+    result = parse_all(st.session_state.messages, build_towers(tower_names))
     st.session_state.result_df = result
     if result.empty:
         st.warning("No usable details were detected. Please check the messages or fill in the missing details manually.")
@@ -525,7 +542,7 @@ if st.button("Organize messages", type="primary"):
         st.success(f"Created {len(result)} row(s). Review the extracted information below.")
 
 if "result_df" in st.session_state and not st.session_state.result_df.empty:
-    st.subheader("2. Review and edit the Excel table")
+    st.subheader("3. Review and edit the Excel table")
     st.caption("The table is editable. Correct any information that was placed in the wrong column. "
                "Use the format 25-Oct for dates.")
     editable = st.data_editor(
@@ -542,10 +559,10 @@ if "result_df" in st.session_state and not st.session_state.result_df.empty:
         }
     )
 
-    st.subheader("3. Download formatted Excel")
+    st.subheader("4. Download formatted Excel")
     st.download_button(
         "⬇️ Download weekly_progress_report.xlsx",
-        data=make_formatted_excel(editable.fillna(""), fill_gaps),
+        data=make_formatted_excel(editable.fillna(""), fill_gaps, tower_names),
         file_name="weekly_progress_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
